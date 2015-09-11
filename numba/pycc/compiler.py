@@ -6,11 +6,18 @@ import os
 import sys
 import functools
 
-import llvm.core as lc
-import llvm.ee as le
+import llvmlite.llvmpy.core as lc
+import llvmlite.llvmpy.ee as le
+import llvmlite.llvmpy.passes as lp
+import llvmlite.binding as ll
 
-from numba import environment, PY3
-from numba import llvm_types as lt
+from numba import cgutils
+from numba.utils import IS_PY3
+from . import llvm_types as lt
+from .decorators import registry as export_registry
+from numba.compiler import compile_extra, Flags
+from numba.targets.registry import CPUTarget
+
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +26,7 @@ __all__ = ['which', 'find_linker', 'find_args', 'find_shared_ending', 'Compiler'
 NULL = lc.Constant.null(lt._void_star)
 ZERO = lc.Constant.int(lt._int32, 0)
 ONE = lc.Constant.int(lt._int32, 1)
+METH_VARARGS_AND_KEYWORDS = lc.Constant.int(lt._int32, 1|2)
 
 
 def which(program):
@@ -52,6 +60,42 @@ find_args = functools.partial(get_configs, 1)
 find_shared_ending = functools.partial(get_configs, 2)
 
 
+def get_header():
+    import numpy
+    import textwrap
+
+    return textwrap.dedent("""\
+    #include <stdint.h>
+
+    #ifndef HAVE_LONGDOUBLE
+        #define HAVE_LONGDOUBLE %d
+    #endif
+
+    typedef struct {
+        float real;
+        float imag;
+    } complex64;
+
+    typedef struct {
+        double real;
+        double imag;
+    } complex128;
+
+    #if HAVE_LONGDOUBLE
+    typedef struct {
+        long double real;
+        long double imag;
+    } complex256;
+    #endif
+
+    typedef float float32;
+    typedef double float64;
+    #if HAVE_LONGDOUBLE
+    typedef long double float128;
+    #endif
+    """ % hasattr(numpy, 'complex256'))
+
+
 class _Compiler(object):
     """A base class to compile Python modules to a single shared library or
     extension module.
@@ -79,12 +123,13 @@ class _Compiler(object):
     def __init__(self, inputs, module_name='numba_exported'):
         self.inputs = inputs
         self.module_name = module_name
+        self.export_python_wrap = False
 
-        self.env = environment.NumbaEnvironment.get_environment()
+    def __enter__(self):
+        return self
 
-        #: Map from function names to type signatures for the translated
-        #: function (used for header generation).
-        self.exported_signatures = {}
+    def __exit__(self, type, value, traceback):
+        del self.exported_signatures[:]
 
     def _emit_python_wrapper(self, llvm_module):
         """Emit generated Python wrapper and extension module code.
@@ -97,59 +142,85 @@ class _Compiler(object):
 
         Resets the export environment afterwards.
         """
-        exports_env = self.env.exports
-        self.exported_signatures = exports_env.function_signature_map
+        self.exported_signatures = export_registry
+        self.exported_function_types = {}
 
-        # Create new module containing everything
-        llvm_module = lc.Module.new(self.module_name)
+        typing_ctx = CPUTarget.typing_context
+        target_ctx = CPUTarget.target_context.subtarget(aot_mode=True)
 
-        # Link in all exported functions
-        for submod in exports_env.function_module_map.values():
-            llvm_module.link_in(submod)
+        codegen = target_ctx.aot_codegen(self.module_name)
+        library = codegen.create_library(self.module_name)
 
-        # Link in cbuilder utilities and string constants
-        self.env.context.cbuilder_library.link(llvm_module)
-        self.env.constants_manager.link(llvm_module)
+        # Generate IR for all exported functions
+        flags = Flags()
+        flags.set("no_compile")
 
-        if exports_env.wrap_exports:
-            self._emit_python_wrapper(llvm_module)
+        for entry in self.exported_signatures:
+            cres = compile_extra(typing_ctx, target_ctx, entry.function,
+                                 entry.signature.args,
+                                 entry.signature.return_type, flags,
+                                 locals={}, library=library)
 
-        exports_env.reset()
-        return llvm_module
+            func_name = cres.fndesc.llvm_func_name
+            llvm_func = cres.library.get_function(func_name)
+
+            if self.export_python_wrap:
+                # XXX: unsupported (necessary?)
+                llvm_func.linkage = lc.LINKAGE_INTERNAL
+                wrappername = cres.fndesc.llvm_cpython_wrapper_name
+                wrapper = cres.library.get_function(wrappername)
+                wrapper.name = entry.symbol
+                wrapper.linkage = lc.LINKAGE_EXTERNAL
+                fnty = cres.target_context.call_conv.get_function_type(
+                    cres.fndesc.restype, cres.fndesc.argtypes)
+                self.exported_function_types[entry] = fnty
+            else:
+                llvm_func.linkage = lc.LINKAGE_EXTERNAL
+                llvm_func.name = entry.symbol
+
+        if self.export_python_wrap:
+            wrapper_module = library.create_ir_module("wrapper")
+            self._emit_python_wrapper(wrapper_module)
+            library.add_ir_module(wrapper_module)
+
+        return library
 
     def _process_inputs(self, wrap=False, **kws):
-        self.env.exports.wrap_exports = wrap
         for ifile in self.inputs:
-            exec(compile(open(ifile).read(), ifile, 'exec'))
+            with open(ifile) as fin:
+                exec(compile(fin.read(), ifile, 'exec'))
+
+        self.export_python_wrap = wrap
 
     def write_llvm_bitcode(self, output, **kws):
         self._process_inputs(**kws)
-        lmod = self._cull_exports()
+        library = self._cull_exports()
         with open(output, 'wb') as fout:
-            lmod.to_bitcode(fout)
+            fout.write(library.emit_bitcode())
 
     def write_native_object(self, output, **kws):
         self._process_inputs(**kws)
-        lmod = self._cull_exports()
-        tm = le.TargetMachine.new(reloc=le.RELOC_PIC, features='-avx')
-        if not kws.get('wrap'):
-            _hack_strip_python_ref(lmod)
+        library = self._cull_exports()
         with open(output, 'wb') as fout:
-            objfile = tm.emit_object(lmod)
-            fout.write(objfile)
+            fout.write(library.emit_native_object())
+
+    def emit_type(self, tyobj):
+        ret_val = str(tyobj)
+        if 'int' in ret_val:
+            if ret_val.endswith(('8', '16', '32', '64')):
+                ret_val += "_t"
+        return ret_val
 
     def emit_header(self, output):
-        from numba.minivect import minitypes
-
         fname, ext = os.path.splitext(output)
         with open(fname + '.h', 'w') as fout:
-            fout.write(minitypes.get_utility())
+            fout.write(get_header())
             fout.write("\n/* Prototypes */\n")
-            for signature in self.exported_signatures.values():
-                name = signature.name
-                restype = signature.return_type.declare()
-                args = ", ".join(argtype.declare()
-                                 for argtype in signature.args)
+            for export_entry in export_registry:
+                name = export_entry.symbol
+                restype = self.emit_type(export_entry.signature.return_type)
+                args = ", ".join(self.emit_type(argtype)
+                                 for argtype in export_entry.signature.args)
                 fout.write("extern %s %s(%s);\n" % (restype, name, args))
 
     def _emit_method_array(self, llvm_module):
@@ -158,17 +229,20 @@ class _Compiler(object):
         :returns: a pointer to the PyMethodDef array.
         """
         method_defs = []
-        wrappers = self.env.exports.function_wrapper_map.items()
-        for name, (submod, lfunc) in wrappers:
-            llvm_module.link_in(submod)
+        for entry in self.exported_signatures:
+            name = entry.symbol
+            fnty = self.exported_function_types[entry]
+            lfunc = llvm_module.add_function(fnty, name=name)
+
             method_name_init = lc.Constant.stringz(name)
             method_name = llvm_module.add_global_variable(
                 method_name_init.type, '.method_name')
             method_name.initializer = method_name_init
-            method_name.linkage = lc.LINKAGE_EXTERNAL
+            method_name.linkage = lc.LINKAGE_INTERNAL
+            method_name.global_constant = True
             method_def_const = lc.Constant.struct((lc.Constant.gep(method_name, [ZERO, ZERO]),
                                                    lc.Constant.bitcast(lfunc, lt._void_star),
-                                                   ONE,
+                                                   METH_VARARGS_AND_KEYWORDS,
                                                    NULL))
             method_defs.append(method_def_const)
 
@@ -188,11 +262,11 @@ class CompilerPy2(_Compiler):
     def module_create_definition(self):
         """Return the signature and name of the function to initialize the module.
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p,
+        signature = lc.Type.function(lt._pyobject_head_p,
                                      (lt._int8_star,
                                       self.method_def_ptr,
                                       lt._int8_star,
-                                      lt._pyobject_head_struct_p,
+                                      lt._pyobject_head_p,
                                       lt._int32))
 
         name = "Py_InitModule4"
@@ -231,7 +305,7 @@ class CompilerPy2(_Compiler):
                            (lc.Constant.gep(mod_name_const, [ZERO, ZERO]),
                             self._emit_method_array(llvm_module),
                             NULL,
-                            lc.Constant.null(lt._pyobject_head_struct_p),
+                            lc.Constant.null(lt._pyobject_head_p),
                             lc.Constant.int(lt._int32, sys.api_version)))
 
         builder.ret_void()
@@ -243,15 +317,15 @@ class CompilerPy3(_Compiler):
 
     #: typedef int (*visitproc)(PyObject *, void *);
     visitproc_ty = _ptr_fun(lt._int8,
-                            lt._pyobject_head_struct_p)
+                            lt._pyobject_head_p)
 
     #: typedef int (*inquiry)(PyObject *);
     inquiry_ty = _ptr_fun(lt._int8,
-                          lt._pyobject_head_struct_p)
+                          lt._pyobject_head_p)
 
     #: typedef int (*traverseproc)(PyObject *, visitproc, void *);
     traverseproc_ty = _ptr_fun(lt._int8,
-                               lt._pyobject_head_struct_p,
+                               lt._pyobject_head_p,
                                visitproc_ty,
                                lt._void_star)
 
@@ -270,11 +344,10 @@ class CompilerPy3(_Compiler):
     #:   Py_ssize_t m_index;
     #:   PyObject* m_copy;
     #: } PyModuleDef_Base;
-    module_def_base_ty = lc.Type.struct((lt._pyobject_head_struct_p,
-                                         lt._void_star,
+    module_def_base_ty = lc.Type.struct((lt._pyobject_head,
                                          m_init_ty,
                                          lt._llvm_py_ssize_t,
-                                         lt._pyobject_head_struct_p))
+                                         lt._pyobject_head_p))
 
     #: This struct holds all information that is needed to create a module object.
     #: typedef struct PyModuleDef{
@@ -302,11 +375,13 @@ class CompilerPy3(_Compiler):
     def module_create_definition(self):
         """Return the signature and name of the function to initialize the module
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p,
+        signature = lc.Type.function(lt._pyobject_head_p,
                                      (lc.Type.pointer(self.module_def_ty),
                                       lt._int32))
 
         name = "PyModule_Create2"
+        if lt._trace_refs_:
+            name += "TraceRefs"
 
         return signature, name
 
@@ -314,12 +389,11 @@ class CompilerPy3(_Compiler):
     def module_init_definition(self):
         """Return the name and signature of the module
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p, ())
+        signature = lc.Type.function(lt._pyobject_head_p, ())
 
         return signature, "PyInit_" + self.module_name
 
     def _emit_python_wrapper(self, llvm_module):
-
         # Figure out the Python C API module creation function, and
         # get a LLVM function for it.
         create_module_fn = llvm_module.add_function(*self.module_create_definition)
@@ -332,11 +406,10 @@ class CompilerPy3(_Compiler):
         mod_name_const.linkage = lc.LINKAGE_INTERNAL
 
         mod_def_base_init = lc.Constant.struct(
-            (lc.Constant.null(lt._pyobject_head_struct_p),  # PyObject_HEAD
-             lc.Constant.null(lt._void_star),               # PyObject_HEAD
+            (lt._pyobject_head_init,                        # PyObject_HEAD
              lc.Constant.null(self.m_init_ty),              # m_init
              lc.Constant.null(lt._llvm_py_ssize_t),         # m_index
-             lc.Constant.null(lt._pyobject_head_struct_p),  # m_copy
+             lc.Constant.null(lt._pyobject_head_p),         # m_copy
             )
         )
         mod_def_base = llvm_module.add_global_variable(mod_def_base_init.type, '.module_def_base')
@@ -369,42 +442,14 @@ class CompilerPy3(_Compiler):
                            (mod_def,
                             lc.Constant.int(lt._int32, sys.api_version)))
 
-        # Test if module has been created correctly
-        cond_true = mod_init_fn.append_basic_block("cond_true")
-        cond_false = mod_init_fn.append_basic_block("cond_false")
-        builder.cbranch(builder.icmp(lc.IPRED_EQ, mod, NULL), cond_true, cond_false)
-        builder.position_at_end(cond_true)
-        builder.ret(NULL)
+        # Test if module has been created correctly.
+        # (XXX for some reason comparing with the NULL constant fails llvm
+        #  with an assertion in pydebug mode)
+        with builder.if_then(cgutils.is_null(builder, mod)):
+            builder.ret(NULL.bitcast(mod_init_fn.type.pointee.return_type))
 
-        builder.position_at_end(cond_false)
         builder.ret(mod)
 
 
-Compiler = CompilerPy3 if PY3 else CompilerPy2
+Compiler = CompilerPy3 if IS_PY3 else CompilerPy2
 
-
-# XXX: hack
-def _hack_strip_python_ref(mod):
-    if int(os.environ.get('NO_PYCC_SYMBOL_STRIP', False)):
-        return # do nothing if the environment variable is set
-
-    removeglobals = ['PyArray_API']
-    for g in removeglobals:
-        try:
-            gv = mod.get_global_variable_named(g)
-        except:
-            pass
-        else:
-            if not gv.uses:
-                gv.delete()
-    removethese = ['IndexAxis', 'NewAxis', 'Broadcast']
-    while True:
-        for func in mod.functions:
-            if func.name.startswith('Py') and not func.uses:
-                func.delete()
-                break
-            elif func.name in removethese and not func.uses:
-                func.delete()
-                break
-        else:
-            break
